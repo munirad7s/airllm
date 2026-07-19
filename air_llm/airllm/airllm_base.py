@@ -123,7 +123,7 @@ class AirLLMBaseModel:
         # on deep models (e.g. Qwen3-235B's 94 layers) and produces garbage; bf16's wider range
         # avoids it. Users can still override via dtype=.
         if dtype is None:
-            cfg_dtype = getattr(self.config, "torch_dtype", None)
+            cfg_dtype = getattr(self.config, "torch_dtype", None) or getattr(self.config, "dtype", None)
             if isinstance(cfg_dtype, str):
                 cfg_dtype = getattr(torch, cfg_dtype, None)
             dtype = cfg_dtype if isinstance(cfg_dtype, torch.dtype) else torch.float16
@@ -229,6 +229,9 @@ class AirLLMBaseModel:
             def dtype(self):
                 return running_dtype
 
+        # transformers 5.x inspects the model class' source module to detect dynamic attention
+        # and expert implementations. Keep that provenance when adding the runtime properties.
+        _AirLLMRuntimeModel.__module__ = base_cls.__module__
         self.model.__class__ = _AirLLMRuntimeModel
 
     def set_layers_from_layer_names(self):

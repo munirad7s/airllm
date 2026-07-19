@@ -31,6 +31,7 @@ else:
         ("AirLLMInternLM", ".airllm_internlm"),
         ("AirLLMMistral", ".airllm_mistral"),
         ("AirLLMMixtral", ".airllm_mixtral"),
+        ("AirLLMGemma4", ".airllm_gemma4"),
     ):
         try:
             _mod = __import__(__name__ + _module, fromlist=[_name])
