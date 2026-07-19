@@ -20,7 +20,7 @@ if platform == "darwin":
 
 import torch
 import torch.nn as nn
-from safetensors.torch import load_file, save_file
+from safetensors import safe_open
 
 from .persist import ModelPersister
 
@@ -113,7 +113,6 @@ def uncompress_layer_state_dict(layer_state_dict):
     return layer_state_dict if uncompressed_layer_state_dict is None else uncompressed_layer_state_dict
 
 def load_layer(local_path, layer_name, profiling=False):
-    #layer_state_dict = load_file(Path(local_path) / (layer_name + ".safetensors"), device="cpu")
     layer_state_dict = ModelPersister.get_model_persister().load_model(layer_name, local_path)
 
     if profiling:
@@ -217,7 +216,6 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
     elif os.path.exists(checkpoint_path / 'model.safetensors'):
         # single-file safetensors checkpoint: map every tensor to that one file
         safetensors_format = True
-        from safetensors import safe_open
         with safe_open(str(checkpoint_path / 'model.safetensors'), framework='pt') as f:
             index = {k: 'model.safetensors' for k in f.keys()}
     elif os.path.exists(checkpoint_path / 'pytorch_model.bin'):
@@ -267,7 +265,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
             print(f"saved layers already found in {saving_path}")
             return str(saving_path)
         else:
-            print(f"some layer splits found, some are not, re-save all layers in case there's some corruptions.")
+            print("some layer splits found; resuming the missing layers.")
 
     if not delete_original:
         check_space(checkpoint_path, layer_shards_saving_path, compression, splitted_model_dir_name=splitted_model_dir_name)
@@ -294,56 +292,77 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         saving_path.mkdir(parents=True, exist_ok=True)
 
     single_modelfile = None
+    safetensor_readers = {}
 
     for layer in tqdm(layers):
 
-        # Optionnally load next shard
-        # checking whether after spliting from '-', if second element exists. otherwise it throws errors for single 'model.safetensor' files
-        shards = [int(v.split('-')[1]) for k, v in index.items() if k.startswith(layer) and '-' in v and len(v.split('-')) > 1]
-        if len(shards) > 0:
-            # A layer can span several shards (especially fp8 checkpoints, where each weight has a
-            # companion weight_scale_inv tensor). Load *every* shard up to the highest one this layer
-            # references, not just the next one -- otherwise the layer is saved missing some tensors
-            # (e.g. the block scales), which silently corrupts fp8 weights.
-            while max(shards) > shard:
-                # optionally delete the original file we're done with (its tensors are already in RAM)
-                if delete_original and shard != 0:
-                    to_delete = checkpoint_path / shard_num_to_file[shard]
+        if found_layers is not None and found_layers.get(layer, False):
+            continue
 
-                    print(f"deleting original file: {to_delete}")
-                    remove_real_and_linked_file(to_delete)
-                shard += 1
-                print(f'Loading shard {shard}/{n_shards}')
+        if safetensors_format:
+            # A repository can put tens of gigabytes in one shard. Map the file and materialize
+            # only the current layer instead of loading the entire shard into RAM.
+            layer_index = {k: v for k, v in index.items() if k.startswith(layer)}
+            layer_state_dict = {}
+            for shard_file in sorted(set(layer_index.values())):
+                to_load = checkpoint_path / shard_file
+                if not os.path.exists(to_load):
+                    assert repo_id is not None
+                    huggingface_hub.snapshot_download(
+                        repo_id, allow_patterns=os.path.basename(to_load), token=hf_token)
 
-                to_load = checkpoint_path / shard_num_to_file[shard]
+                if shard_file not in safetensor_readers:
+                    safetensor_readers[shard_file] = safe_open(
+                        str(to_load), framework="pt", device="cpu")
+                shard_reader = safetensor_readers[shard_file]
+                for key, filename in layer_index.items():
+                    if filename == shard_file:
+                        # Keep an owned copy and keep the source mmap open for the complete split.
+                        # Repeatedly closing huge mappings can crash torch_cpu.dll on Windows.
+                        layer_state_dict[key] = shard_reader.get_tensor(key).clone()
 
+        else:
+            # Optionnally load next shard
+            # checking whether after spliting from '-', if second element exists. otherwise it throws errors for single 'model.safetensor' files
+            shards = [int(v.split('-')[1]) for k, v in index.items() if k.startswith(layer) and '-' in v and len(v.split('-')) > 1]
+            if len(shards) > 0:
+                # A layer can span several shards (especially fp8 checkpoints, where each weight has a
+                # companion weight_scale_inv tensor). Load *every* shard up to the highest one this layer
+                # references, not just the next one -- otherwise the layer is saved missing some tensors
+                # (e.g. the block scales), which silently corrupts fp8 weights.
+                while max(shards) > shard:
+                    # optionally delete the original file we're done with (its tensors are already in RAM)
+                    if delete_original and shard != 0:
+                        to_delete = checkpoint_path / shard_num_to_file[shard]
+
+                        print(f"deleting original file: {to_delete}")
+                        remove_real_and_linked_file(to_delete)
+                    shard += 1
+                    print(f'Loading shard {shard}/{n_shards}')
+
+                    to_load = checkpoint_path / shard_num_to_file[shard]
+
+                    # check if to_load exist, if not downloaad it...
+                    if not os.path.exists(to_load):
+                        assert repo_id is not None
+                        huggingface_hub.snapshot_download(repo_id, allow_patterns=os.path.basename(to_load),
+                                                        token=hf_token)
+
+                    state_dict.update(torch.load(to_load, map_location='cpu'))
+
+            else:
+                shards = [v for k, v in index.items() if k.startswith(layer)]
+                single_modelfile = shards[0]
+                to_load = checkpoint_path / single_modelfile
                 # check if to_load exist, if not downloaad it...
                 if not os.path.exists(to_load):
                     assert repo_id is not None
                     huggingface_hub.snapshot_download(repo_id, allow_patterns=os.path.basename(to_load),
                                                     token=hf_token)
-
-                if not safetensors_format:
-                    state_dict.update(torch.load(to_load, map_location='cpu'))
-                else:
-                    state_dict.update(load_file(to_load, device='cpu'))
-
-        else:
-            shards = [v for k, v in index.items() if k.startswith(layer)]
-            single_modelfile = shards[0]
-            to_load = checkpoint_path / single_modelfile
-            # check if to_load exist, if not downloaad it...
-            if not os.path.exists(to_load):
-                assert repo_id is not None
-                huggingface_hub.snapshot_download(repo_id, allow_patterns=os.path.basename(to_load),
-                                                token=hf_token)
-            if not safetensors_format:
                 state_dict.update(torch.load(to_load, map_location='cpu'))
-            else:
-                state_dict.update(load_file(to_load, device='cpu'))
 
-        # Get layer state dict
-        layer_state_dict = dict([(k, v) for k, v in state_dict.items() if k.startswith(layer)])
+            # Get layer state dict
+            layer_state_dict = dict([(k, v) for k, v in state_dict.items() if k.startswith(layer)])
 
         layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
 
@@ -354,15 +373,26 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
             ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
 
         # Free memory
-        for k in layer_state_dict.keys():
-            if k in state_dict:
-                del state_dict[k]
+        if not safetensors_format:
+            for k in layer_state_dict.keys():
+                if k in state_dict:
+                    del state_dict[k]
         del layer_state_dict
         clean_memory()
 
+    safetensor_readers.clear()
+    clean_memory()
+
+    if delete_original and safetensors_format:
+        for shard_file in sorted(set(index.values())):
+            to_delete = checkpoint_path / shard_file
+            if os.path.exists(to_delete):
+                print(f"deleting original file: {to_delete}")
+                remove_real_and_linked_file(to_delete)
+
     # deleting single modelfile if only a single modelfile was existing in hf repo 
     # and deletion of single modelfile should happen in the end if delete_original=True
-    if delete_original and single_modelfile != None:
+    if delete_original and not safetensors_format and single_modelfile != None:
         to_delete = checkpoint_path / single_modelfile
         print(f"deleting original file: {to_delete}")
         remove_real_and_linked_file(to_delete)

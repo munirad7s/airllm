@@ -94,11 +94,16 @@ Then, initialize AirLLMLlama2, pass in the huggingface repo ID of the model bein
 (*You can also specify the path to save the splitted layered model through **layer_shards_saving_path** when init AirLLMLlama2.*
 
 ```python
+import torch
+
 from airllm import AutoModel
 
 MAX_LENGTH = 128
 # just pass a hugging face repo id — works with almost any popular model:
 model = AutoModel.from_pretrained("Qwen/Qwen3-32B")
+
+# Gemma 4's language model can be streamed from the multimodal checkpoint:
+# model = AutoModel.from_pretrained("google/gemma-4-31b-it", dtype=torch.bfloat16)
 
 # go bigger with the exact same one line:
 #model = AutoModel.from_pretrained("Qwen/Qwen3-235B-A22B")     # 235B, runs in ~3GB
@@ -271,6 +276,11 @@ model.tokenizer.decode(generation_output.sequences[0])
 AirLLM works out of the box with **virtually every popular open LLM** — just pass its Hugging Face ID to `AutoModel.from_pretrained(...)`. That covers all the major families:
 
 **Llama** (2 / 3 / 3.1 / 3.3 / 4) · **Qwen** (1 / 2 / 2.5 / 3, including MoE and FP8) · **DeepSeek** (V2 / V3 / R1) · **Mistral & Mixtral** · **Phi** · **Gemma** · **ChatGLM** · **Baichuan** · **InternLM** · **Yi** — and most new models the day they're released.
+
+Gemma 4 multimodal checkpoints, including `google/gemma-4-31b-it`, are supported for
+**text-only generation**. Image, video and audio inputs are not streamed by AirLLM.
+The 31B checkpoint needs about 116 GiB of disk space while both the original and split
+weights are retained.
 
 ### Tiny GPU, huge models
 
